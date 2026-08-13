@@ -2015,8 +2015,16 @@ fn read_table_cell(reader: &mut DwgMergedReader, version: DwgVersion) -> TableCe
         reader.read_bit_long(); // unknown
     }
     let ncontents = safe_count(reader.read_bit_long());
-    for _ in 0..ncontents {
-        cell.contents.push(read_table_cell_content(reader, version));
+    // A real cell holds a handful of contents (text / field / block). A huge
+    // count means the bit cursor desynced in the version-dependent fields
+    // above — pushing tens of thousands of junk contents balloons the DXF by
+    // orders of magnitude (observed: 2.8 MB DWG → 251 MB DXF, ~70% repeated
+    // group-170 pairs). Treat a desynced count as "no contents".
+    const MAX_CELL_CONTENTS: i32 = 64;
+    if ncontents <= MAX_CELL_CONTENTS {
+        for _ in 0..ncontents {
+            cell.contents.push(read_table_cell_content(reader, version));
+        }
     }
     read_cell_style(reader); // cell style override
     reader.read_bit_long(); // style id
@@ -2042,7 +2050,19 @@ fn read_table_content(
     let _name = reader.read_variable_text();
     let _description = reader.read_variable_text();
 
+    // Desync containment: once the bit cursor slips in the version-dependent
+    // fields, every later count is noise. A real table has bounded
+    // dimensions, and a row never holds more cells than there are columns —
+    // an impossible count means the rest of the object is unreadable, so
+    // return what was read so far instead of manufacturing junk cells
+    // (observed: one desynced table emitted tens of thousands of empty cells
+    // into the DXF).
+    const MAX_TABLE_DIM: i32 = 4096;
+
     let ncols = safe_count(reader.read_bit_long());
+    if ncols > MAX_TABLE_DIM {
+        return (Vec::new(), Vec::new(), 0);
+    }
     let mut columns = Vec::with_capacity(ncols as usize);
     for _ in 0..ncols {
         let name = reader.read_variable_text();
@@ -2063,9 +2083,15 @@ fn read_table_content(
     }
 
     let nrows = safe_count(reader.read_bit_long());
+    if nrows > MAX_TABLE_DIM {
+        return (columns, Vec::new(), 0);
+    }
     let mut rows = Vec::with_capacity(nrows as usize);
     for _ in 0..nrows {
         let ncells = safe_count(reader.read_bit_long());
+        if ncells > ncols.max(1) {
+            return (columns, rows, 0); // desynced mid-table: keep prior rows
+        }
         let mut cells = Vec::with_capacity(ncells as usize);
         for _ in 0..ncells {
             cells.push(read_table_cell(reader, version));
